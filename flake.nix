@@ -48,7 +48,7 @@
           
           meta = with pkgs.lib; {
             description = "HTTP response time measurement tool";
-            homepage = "https://github.com/yourusername/httping";
+            homepage = "https://github.com/cransom/httping";
             license = licenses.mit;
             maintainers = [ ];
             platforms = platforms.all;

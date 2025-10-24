@@ -14,12 +14,33 @@ import requests
 import socket
 
 
+# ANSI color codes
+class Colors:
+    RED = '\033[91m'
+    BRIGHT_RED = '\033[31m'
+    YELLOW = '\033[93m'
+    BRIGHT_YELLOW = '\033[33m'
+    GREEN = '\033[92m'
+    BRIGHT_GREEN = '\033[32m'
+    CYAN = '\033[96m'
+    BLUE = '\033[94m'
+    MAGENTA = '\033[95m'
+    RESET = '\033[0m'
+
+
 class HTTPing:
-    def __init__(self, site: str, headers: Optional[List[str]] = None, interval: float = 1.0):
+    def __init__(self, site: str, headers: Optional[List[str]] = None, interval: float = 1.0, timeout: float = 5.0, quiet: bool = False, count: Optional[int] = None):
         self.site = site
         self.headers = headers or []
         self.interval = interval
+        self.timeout = timeout
+        self.quiet = quiet
+        self.count = count
         self.session = requests.Session()
+        # Set custom User-Agent
+        self.session.headers.update({'User-Agent': 'httping/mad'})
+        # Track previous body length for change detection
+        self.previous_body_length = None
         
     def parse_headers(self) -> List[re.Pattern]:
         """Parse header regex patterns from command line input"""
@@ -57,7 +78,7 @@ class HTTPing:
         start_time = time.time()
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(10)  # 10 second timeout
+            sock.settimeout(self.timeout)
             sock.connect((host, port))
             sock.close()
             return (time.time() - start_time) * 1000  # Convert to milliseconds
@@ -76,7 +97,7 @@ class HTTPing:
         # Measure full request duration
         start_time = time.time()
         try:
-            response = self.session.get(self.site, timeout=10, allow_redirects=False)
+            response = self.session.get(self.site, timeout=self.timeout, allow_redirects=False)
             duration = (time.time() - start_time) * 1000  # Convert to milliseconds
             
             # Extract headers and body length
@@ -101,9 +122,23 @@ class HTTPing:
                     break
         return filtered
     
+    
+    def get_status_color(self, status: int, body_length_change: float = 0.0) -> str:
+        """Get color code based on HTTP status and body length change"""
+        if status == -1:  # Timeout or connection error
+            return Colors.RED
+        elif status >= 400:  # Client/Server errors
+            return Colors.RED
+        elif 300 <= status <= 399:  # Redirects - always yellow
+            return Colors.YELLOW
+        elif body_length_change > 0.10:  # Large body length change (>10%)
+            return Colors.YELLOW
+        else:  # 200-299 Success - no color change
+            return Colors.RESET
+    
     def format_output(self, status: int, tcp_time: float, duration: float, 
-                     filtered_headers: Dict[str, str], body_length: int) -> str:
-        """Format the output line"""
+                     filtered_headers: Dict[str, str], body_length: int, body_length_change: float = 0.0) -> str:
+        """Format the output line with color coding"""
         # Format site (truncate if too long)
         site_display = self.site[:50] + "..." if len(self.site) > 50 else self.site
         
@@ -124,32 +159,96 @@ class HTTPing:
         output_parts = [
             f"{status_str}",
             f"length={self.format_bytes(body_length)}",
-            f"tcp_time={tcp_str}",
-            f"request_time={duration_str}"
+            f"tcp/total={tcp_str}/{duration_str}"
         ]
         
         if headers_str:
             output_parts.append(headers_str)
         
-        return f"{site_display}: {', '.join(output_parts)}"
+        # Add message if large body length change
+        if body_length_change > 0.10:
+            change_percent = body_length_change * 100
+            output_parts.append(f"large body length change (+{change_percent:.1f}%)")
+        
+        # Apply color coding
+        color = self.get_status_color(status, body_length_change)
+        output = f"{site_display}: {', '.join(output_parts)}"
+        return f"{color}{output}{Colors.RESET}"
     
     def run_once(self) -> None:
         """Run a single HTTP ping"""
         patterns = self.parse_headers()
         status, tcp_time, duration, headers, body_length = self.make_request()
+        
+        # Calculate body length change percentage
+        body_length_change = 0.0
+        if self.previous_body_length is not None and self.previous_body_length > 0:
+            change = abs(body_length - self.previous_body_length)
+            body_length_change = change / self.previous_body_length
+        
         filtered_headers = self.filter_headers(headers, patterns)
         
-        output = self.format_output(status, tcp_time, duration, filtered_headers, body_length)
+        output = self.format_output(status, tcp_time, duration, filtered_headers, body_length, body_length_change)
         print(output)
+        
+        # Print bell character on any failure or large body length change unless quiet mode is enabled
+        if not self.quiet and (self.is_failure(status) or body_length_change > 0.10):
+            print('\a', end='', flush=True)
+        
+        # Update previous body length for next iteration
+        self.previous_body_length = body_length
+    
+    def is_failure(self, status: int) -> bool:
+        """Check if status code represents a failure that should trigger bell"""
+        return status >= 400  # Only HTTP errors 400+ (client and server errors)
+    
+    def run_verbose(self) -> None:
+        """Run a single request and show all headers"""
+        patterns = self.parse_headers()
+        status, tcp_time, duration, headers, body_length = self.make_request()
+        
+        print(f"HTTPing {self.site}")
+        print("-" * 80)
+        
+        # Format site (truncate if too long)
+        site_display = self.site[:50] + "..." if len(self.site) > 50 else self.site
+        
+        # Format status
+        status_str = str(status) if status != -1 else "ERROR"
+        
+        # Format times
+        tcp_str = f"{tcp_time:.2f}ms" if tcp_time != -1 else "FAIL"
+        duration_str = f"{duration:.2f}ms"
+        
+        # Show basic info with color coding
+        color = self.get_status_color(status)
+        basic_info = f"{site_display}: {status_str}, length={self.format_bytes(body_length)}, tcp_time={tcp_str}, request_time={duration_str}"
+        print(f"{color}{basic_info}{Colors.RESET}")
+        print()
+        
+        # Show all headers
+        if headers:
+            print("Headers:")
+            for name, value in sorted(headers.items()):
+                print(f"  {name}: {value}")
+        else:
+            print("No headers received")
     
     def run_continuous(self) -> None:
         """Run continuous HTTP pings at specified interval"""
-        print(f"HTTPing {self.site} every {self.interval}s (Ctrl+C to stop)")
+        if self.count is not None:
+            print(f"HTTPing {self.site} every {self.interval}s ({self.count} times)")
+        else:
+            print(f"HTTPing {self.site} every {self.interval}s (Ctrl+C to stop)")
         print("-" * 80)
         
         try:
+            ping_count = 0
             while True:
                 self.run_once()
+                ping_count += 1
+                if self.count is not None and ping_count >= self.count:
+                    break
                 time.sleep(self.interval)
         except KeyboardInterrupt:
             print("\nStopped.")
@@ -162,9 +261,13 @@ def main():
         epilog="""
 Examples:
   %(prog)s https://example.com
-  %(prog)s https://example.com -i 2.5
+  %(prog)s https://example.com -d 0.5
   %(prog)s https://example.com -H "server,content-type"
   %(prog)s https://example.com -H "server" -H "content-type"
+  %(prog)s https://example.com -v
+  %(prog)s https://example.com -t 5.0
+  %(prog)s https://example.com -d 0.1 -t 0.5
+  %(prog)s https://example.com -q
         """
     )
     
@@ -186,6 +289,38 @@ Examples:
         help='Header names to display (regex patterns, comma-separated). Can be used multiple times.'
     )
     
+    parser.add_argument(
+        '-v', '--verbose',
+        action='store_true',
+        help='Show all headers from a single request instead of continuous pinging'
+    )
+    
+    parser.add_argument(
+        '-t', '--timeout',
+        type=float,
+        default=5.0,
+        help='Request timeout in seconds (default: 5.0)'
+    )
+    
+    parser.add_argument(
+        '-d', '--delay',
+        type=float,
+        default=1.0,
+        help='Delay between requests in seconds (default: 1.0, use smaller values for faster pings)'
+    )
+    
+    parser.add_argument(
+        '-q', '--quiet',
+        action='store_true',
+        help='Disable bell alerts on failures'
+    )
+    
+    parser.add_argument(
+        '-c', '--count',
+        type=int,
+        help='Stop after sending this many pings'
+    )
+    
     args = parser.parse_args()
     
     # Flatten headers if provided
@@ -199,8 +334,12 @@ Examples:
         args.site = 'https://' + args.site
     
     # Create and run HTTPing instance
-    httping = HTTPing(args.site, headers, args.interval)
-    httping.run_continuous()
+    httping = HTTPing(args.site, headers, args.delay, args.timeout, args.quiet, args.count)
+    
+    if args.verbose:
+        httping.run_verbose()
+    else:
+        httping.run_continuous()
 
 
 if __name__ == '__main__':
