@@ -9,6 +9,7 @@ import re
 import sys
 import time
 import urllib.parse
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import requests
 import socket
@@ -29,12 +30,13 @@ class Colors:
 
 
 class HTTPing:
-    def __init__(self, site: str, headers: Optional[List[str]] = None, interval: float = 1.0, timeout: float = 5.0, quiet: bool = False, count: Optional[int] = None):
+    def __init__(self, site: str, headers: Optional[List[str]] = None, interval: float = 1.0, timeout: float = 5.0, quiet: bool = False, bell: bool = False, count: Optional[int] = None):
         self.site = site
         self.headers = headers or []
         self.interval = interval
         self.timeout = timeout
         self.quiet = quiet
+        self.bell = bell
         self.count = count
         self.session = requests.Session()
         # Set custom User-Agent
@@ -73,26 +75,12 @@ class HTTPing:
         else:
             return f"{size:.1f}{units[unit_index]}"
     
-    def measure_tcp_connect_time(self, host: str, port: int) -> float:
-        """Measure TCP connection time"""
-        start_time = time.time()
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(self.timeout)
-            sock.connect((host, port))
-            sock.close()
-            return (time.time() - start_time) * 1000  # Convert to milliseconds
-        except Exception:
-            return -1  # Connection failed
-    
     def make_request(self) -> Tuple[int, float, float, Dict[str, str], int]:
-        """Make HTTP request and return status, tcp_time, duration, headers, and body_length"""
+        """Make HTTP request and return status, duration, headers, and body_length"""
         parsed_url = urllib.parse.urlparse(self.site)
         host = parsed_url.hostname
         port = parsed_url.port or (443 if parsed_url.scheme == 'https' else 80)
         
-        # Measure TCP connection time
-        tcp_time = self.measure_tcp_connect_time(host, port)
         
         # Measure full request duration
         start_time = time.time()
@@ -104,10 +92,10 @@ class HTTPing:
             headers = dict(response.headers)
             body_length = len(response.content)
             
-            return response.status_code, tcp_time, duration, headers, body_length
+            return response.status_code, duration, headers, body_length
         except Exception as e:
             duration = (time.time() - start_time) * 1000
-            return -1, tcp_time, duration, {}, 0
+            return -1, duration, {}, 0
     
     def filter_headers(self, headers: Dict[str, str], patterns: List[re.Pattern]) -> Dict[str, str]:
         """Filter headers based on regex patterns"""
@@ -136,7 +124,7 @@ class HTTPing:
         else:  # 200-299 Success - no color change
             return Colors.RESET
     
-    def format_output(self, status: int, tcp_time: float, duration: float, 
+    def format_output(self, status: int, duration: float, 
                      filtered_headers: Dict[str, str], body_length: int, body_length_change: float = 0.0) -> str:
         """Format the output line with color coding"""
         # Format site (truncate if too long)
@@ -146,8 +134,9 @@ class HTTPing:
         status_str = str(status) if status != -1 else "ERROR"
         
         # Format times
-        tcp_str = f"{tcp_time:.2f}ms" if tcp_time != -1 else "FAIL"
         duration_str = f"{duration:.2f}ms"
+
+        timestamp = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
         
         # Format headers
         header_parts = []
@@ -159,7 +148,7 @@ class HTTPing:
         output_parts = [
             f"{status_str}",
             f"length={self.format_bytes(body_length)}",
-            f"tcp/total={tcp_str}/{duration_str}"
+            f"total={duration_str}"
         ]
         
         if headers_str:
@@ -172,13 +161,13 @@ class HTTPing:
         
         # Apply color coding
         color = self.get_status_color(status, body_length_change)
-        output = f"{site_display}: {', '.join(output_parts)}"
+        output = f"{timestamp} {site_display}: {', '.join(output_parts)}"
         return f"{color}{output}{Colors.RESET}"
     
     def run_once(self) -> None:
         """Run a single HTTP ping"""
         patterns = self.parse_headers()
-        status, tcp_time, duration, headers, body_length = self.make_request()
+        status, duration, headers, body_length = self.make_request()
         
         # Calculate body length change percentage
         body_length_change = 0.0
@@ -188,7 +177,7 @@ class HTTPing:
         
         filtered_headers = self.filter_headers(headers, patterns)
         
-        output = self.format_output(status, tcp_time, duration, filtered_headers, body_length, body_length_change)
+        output = self.format_output(status, duration, filtered_headers, body_length, body_length_change)
         print(output)
         
         # Print bell character on any failure or large body length change unless quiet mode is enabled
@@ -205,7 +194,7 @@ class HTTPing:
     def run_verbose(self) -> None:
         """Run a single request and show all headers"""
         patterns = self.parse_headers()
-        status, tcp_time, duration, headers, body_length = self.make_request()
+        status, duration, headers, body_length = self.make_request()
         
         print(f"HTTPing {self.site}")
         print("-" * 80)
@@ -217,12 +206,11 @@ class HTTPing:
         status_str = str(status) if status != -1 else "ERROR"
         
         # Format times
-        tcp_str = f"{tcp_time:.2f}ms" if tcp_time != -1 else "FAIL"
         duration_str = f"{duration:.2f}ms"
         
         # Show basic info with color coding
         color = self.get_status_color(status)
-        basic_info = f"{site_display}: {status_str}, length={self.format_bytes(body_length)}, tcp_time={tcp_str}, request_time={duration_str}"
+        basic_info = f"{site_display}: {status_str}, length={self.format_bytes(body_length)}, request_time={duration_str}"
         print(f"{color}{basic_info}{Colors.RESET}")
         print()
         
@@ -314,6 +302,12 @@ Examples:
         action='store_true',
         help='Disable bell alerts on failures'
     )
+
+    parser.add_argument(
+        '-b', '--bell',
+        type=int,
+        help='Reverse the behavior of the bell (bell on success)'
+    )
     
     parser.add_argument(
         '-c', '--count',
@@ -334,7 +328,7 @@ Examples:
         args.site = 'https://' + args.site
     
     # Create and run HTTPing instance
-    httping = HTTPing(args.site, headers, args.delay, args.timeout, args.quiet, args.count)
+    httping = HTTPing(args.site, headers, args.delay, args.timeout, args.quiet, args.bell, args.count)
     
     if args.verbose:
         httping.run_verbose()
