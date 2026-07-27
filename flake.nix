@@ -18,6 +18,7 @@
           buildInputs = with pythonPackages; [
             python
             requests
+            dnspython
           ];
           
           shellHook = ''
@@ -37,7 +38,7 @@
           src = ./.;
           
           buildInputs = with pythonPackages; [
-            (python.withPackages (ps: [ ps.requests ]))
+            (python.withPackages (ps: [ ps.requests ps.dnspython ]))
           ];
           
           installPhase = ''

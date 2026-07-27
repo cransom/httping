@@ -14,6 +14,11 @@ from typing import Dict, List, Optional, Tuple
 import requests
 import socket
 
+try:
+    import dns.resolver
+except ImportError:
+    pass
+
 
 # ANSI color codes
 class Colors:
@@ -30,7 +35,7 @@ class Colors:
 
 
 class HTTPing:
-    def __init__(self, site: str, headers: Optional[List[str]] = None, interval: float = 1.0, timeout: float = 5.0, quiet: bool = False, bell: bool = False, count: Optional[int] = None):
+    def __init__(self, site: str, headers: Optional[List[str]] = None, interval: float = 1.0, timeout: float = 5.0, quiet: bool = False, bell: bool = False, count: Optional[int] = None, dns_server: Optional[str] = None):
         self.site = site
         self.headers = headers or []
         self.interval = interval
@@ -38,6 +43,7 @@ class HTTPing:
         self.quiet = quiet
         self.bell = bell
         self.count = count
+        self.dns_server = dns_server
         self.session = requests.Session()
         # Set custom User-Agent
         self.session.headers.update({'User-Agent': 'httping/mad'})
@@ -75,28 +81,86 @@ class HTTPing:
         else:
             return f"{size:.1f}{units[unit_index]}"
     
-    def make_request(self) -> Tuple[int, float, float, Dict[str, str], int]:
-        """Make HTTP request and return status, duration, headers, and body_length"""
+    def make_request(self) -> Tuple[int, float, float, Dict[str, str], int, Optional[str]]:
+        """Make HTTP request and return status, duration, headers, body_length, and resolved IP."""
         parsed_url = urllib.parse.urlparse(self.site)
         host = parsed_url.hostname
-        port = parsed_url.port or (443 if parsed_url.scheme == 'https' else 80)
-        
-        
-        # Measure full request duration
+
+        if self.dns_server:
+            return self._make_request_with_dns(host)
+        else:
+            return self._make_request_session() + (None,)
+
+    def _make_request_session(self) -> Tuple[int, float, float, Dict[str, str], int]:
+        """Make HTTP request using the persistent session (default DNS)."""
         start_time = time.time()
         try:
             response = self.session.get(self.site, timeout=self.timeout, allow_redirects=False)
-            duration = (time.time() - start_time) * 1000  # Convert to milliseconds
-            
-            # Extract headers and body length
+            duration = (time.time() - start_time) * 1000
             headers = dict(response.headers)
             body_length = len(response.content)
-            
             return response.status_code, duration, headers, body_length
         except Exception as e:
             duration = (time.time() - start_time) * 1000
             return -1, duration, {}, 0
-    
+
+    def _make_request_with_dns(self, host: str) -> Tuple[int, float, float, Dict[str, str], int, str]:
+        """Make HTTP request with forced DNS resolution against a specific server."""
+        if 'dns' not in sys.modules:
+            print("Error: --dns requires the dnspython library. Install with: pip install dnspython", file=sys.stderr)
+            sys.exit(1)
+
+        resolver = dns.resolver.Resolver(configure=False)
+        resolver.nameservers = [self.dns_server]
+        resolver.timeout = self.timeout
+        resolver.lifetime = self.timeout
+
+        ips = []
+        for rdtype in ['A', 'AAAA']:
+            try:
+                answers = resolver.resolve(host, rdtype)
+                ips.extend([str(rdata) for rdata in answers])
+            except Exception:
+                continue
+
+        if not ips:
+            raise Exception(f"DNS resolution failed for {host} via {self.dns_server}")
+
+        resolved_ip = ips[0]
+
+        start_time = time.time()
+        try:
+            original_getaddrinfo = socket.getaddrinfo
+
+            def patched_getaddrinfo(h, p, family=0, type=0, proto=0, flags=0):
+                if h == host:
+                    results = []
+                    for ip in ips:
+                        af = socket.AF_INET6 if ':' in ip else socket.AF_INET
+                        if family == 0 or family == af:
+                            results.append((af, socket.SOCK_STREAM, 6, '', (ip, p)))
+                    if results:
+                        return results
+                return original_getaddrinfo(h, p, family, type, proto, flags)
+
+            socket.getaddrinfo = patched_getaddrinfo
+            try:
+                response = requests.get(
+                    self.site,
+                    headers={'User-Agent': 'httping/mad'},
+                    timeout=self.timeout,
+                    allow_redirects=False
+                )
+                duration = (time.time() - start_time) * 1000
+                headers = dict(response.headers)
+                body_length = len(response.content)
+                return response.status_code, duration, headers, body_length, resolved_ip
+            finally:
+                socket.getaddrinfo = original_getaddrinfo
+        except Exception as e:
+            duration = (time.time() - start_time) * 1000
+            return -1, duration, {}, 0, resolved_ip
+
     def filter_headers(self, headers: Dict[str, str], patterns: List[re.Pattern]) -> Dict[str, str]:
         """Filter headers based on regex patterns"""
         if not patterns:
@@ -125,7 +189,7 @@ class HTTPing:
             return Colors.RESET
     
     def format_output(self, status: int, duration: float, 
-                     filtered_headers: Dict[str, str], body_length: int, body_length_change: float = 0.0) -> str:
+                      filtered_headers: Dict[str, str], body_length: int, body_length_change: float = 0.0, resolved_ip: Optional[str] = None) -> str:
         """Format the output line with color coding"""
         # Format site (truncate if too long)
         site_display = self.site[:50] + "..." if len(self.site) > 50 else self.site
@@ -150,6 +214,9 @@ class HTTPing:
             f"length={self.format_bytes(body_length)}",
             f"total={duration_str}"
         ]
+
+        if resolved_ip:
+            output_parts.append(f"connected_to={resolved_ip}")
         
         if headers_str:
             output_parts.append(headers_str)
@@ -167,7 +234,7 @@ class HTTPing:
     def run_once(self) -> None:
         """Run a single HTTP ping"""
         patterns = self.parse_headers()
-        status, duration, headers, body_length = self.make_request()
+        status, duration, headers, body_length, resolved_ip = self.make_request()
         
         # Calculate body length change percentage
         body_length_change = 0.0
@@ -177,7 +244,7 @@ class HTTPing:
         
         filtered_headers = self.filter_headers(headers, patterns)
         
-        output = self.format_output(status, duration, filtered_headers, body_length, body_length_change)
+        output = self.format_output(status, duration, filtered_headers, body_length, body_length_change, resolved_ip)
         print(output)
         
         # Print bell character on any failure or large body length change unless quiet mode is enabled
@@ -194,7 +261,7 @@ class HTTPing:
     def run_verbose(self) -> None:
         """Run a single request and show all headers"""
         patterns = self.parse_headers()
-        status, duration, headers, body_length = self.make_request()
+        status, duration, headers, body_length, _ = self.make_request()
         
         print(f"HTTPing {self.site}")
         print("-" * 80)
@@ -256,6 +323,8 @@ Examples:
   %(prog)s https://example.com -t 5.0
   %(prog)s https://example.com -d 0.1 -t 0.5
   %(prog)s https://example.com -q
+  %(prog)s https://example.com --dns 8.8.8.8
+  %(prog)s https://example.com --dns 1.1.1.1
         """
     )
     
@@ -304,6 +373,14 @@ Examples:
     )
 
     parser.add_argument(
+        '--dns',
+        type=str,
+        default=None,
+        metavar='SERVER',
+        help='Re-resolve DNS on every request using the specified DNS server (e.g., 1.1.1.1)'
+    )
+
+    parser.add_argument(
         '-b', '--bell',
         type=int,
         help='Reverse the behavior of the bell (bell on success)'
@@ -328,7 +405,7 @@ Examples:
         args.site = 'https://' + args.site
     
     # Create and run HTTPing instance
-    httping = HTTPing(args.site, headers, args.delay, args.timeout, args.quiet, args.bell, args.count)
+    httping = HTTPing(args.site, headers, args.delay, args.timeout, args.quiet, args.bell, args.count, args.dns)
     
     if args.verbose:
         httping.run_verbose()
